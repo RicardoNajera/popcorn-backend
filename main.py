@@ -1,4 +1,5 @@
 import os
+import gc
 import json
 import boto3
 import numpy as np
@@ -30,7 +31,7 @@ def obtener_vector_texto(texto: str):
             contents=texto.strip(),
             config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
         )
-        vec = np.array(res.embedding.values, dtype=np.float32)
+        vec = np.array(res.embedding.values, dtype=np.float16)
         norm = np.linalg.norm(vec)
         return (vec / norm) if norm > 0 else vec
     except Exception as e:
@@ -41,7 +42,8 @@ def buscar_por_vector(vector_query, indices_disponibles, k=15):
     if vector_query is None or len(indices_disponibles) == 0:
         return []
     sub_vectores = matriz_vectores[indices_disponibles]
-    similitudes = np.dot(sub_vectores, vector_query)
+    # Calculo dot product en float32 para precisión numérica en ranking
+    similitudes = np.dot(sub_vectores.astype(np.float32), vector_query.astype(np.float32))
     ranking = np.argsort(similitudes)[::-1]
     mejores_pos = ranking[:k]
     return [indices_disponibles[p] for p in mejores_pos]
@@ -56,17 +58,16 @@ def consultar_tendencias_gemini(tipo: str):
 
     prompt_curaduria = f"""
     Eres el director de programación de una plataforma de streaming en México. Hoy es {fecha_str}.
-    Analiza las tendencias actuales de consumo de medios, fechas destacadas y gustos de la audiencia mexicana.
+    Analiza tendencias de consumo en internet, temporadas culturales y cine en México.
     
     Genera exactamente 30 filas temáticas para la categoría '{tipo}'.
-    Requisitos indispensables:
-    1. Fila 1: Lo más relevante según el calendario, festividades o eventos del momento en México.
-    2. Progresión para Películas/Series: Iniciar con géneros de alta demanda (terror, misterio o suspenso), transicionar por curiosidades, ciencia ficción, tecnología e historias de impacto, y concluir hacia temáticas más ligeras o familiares.
-    3. Para Televisión: Priorizar deportes, señales en directo e informativas antes de pasar a entretenimiento general.
+    1. Fila 1: Lo más relevante según las fechas o festividades actuales en México.
+    2. Progresión para Películas/Series: Iniciar con alta tensión (terror, suspenso), pasar a curiosidades/misterio, ciencia ficción, tecnología y rematar con contenido familiar/ligero.
+    3. Para Televisión: Priorizar deportes y noticias en vivo.
     
-    Responde ÚNICAMENTE en formato JSON con la siguiente estructura (sin bloques markdown adicionales):
+    Responde ÚNICAMENTE en formato JSON plano:
     [
-      {{"titulo": "Título atractivo para la fila en pantalla", "query": "descripción semántica detallada para buscar coincidencias"}}
+      {{"titulo": "Título atractivo para la fila en pantalla", "query": "descripción semántica para buscar coincidencias"}}
     ]
     """
 
@@ -82,7 +83,7 @@ def consultar_tendencias_gemini(tipo: str):
         if isinstance(data, list) and len(data) >= 10:
             return data
     except Exception as e:
-        print(f"Error al consultar curaduría en tiempo real: {e}")
+        print(f"Error en consulta Gemini: {e}")
     return None
 
 @asynccontextmanager
@@ -100,7 +101,7 @@ async def lifespan(app: FastAPI):
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY
         )
-        print("📥 Descargando catálogo vectorizado desde R2...")
+        print("📥 Descargando catálogo vectorizado...")
         obj = s3.get_object(Bucket=R2_BUCKET, Key="M3U Vectorizado.json")
         data = json.loads(obj["Body"].read().decode("utf-8"))
 
@@ -114,11 +115,22 @@ async def lifespan(app: FastAPI):
             })
             vectores.append(item.get("vector", []))
 
-        matriz_vectores = np.array(vectores, dtype=np.float32)
-        normas = np.linalg.norm(matriz_vectores, axis=1, keepdims=True)
+        # Liberar memoria del JSON crudo
+        del data
+        del obj
+        gc.collect()
+
+        # float16 reduce el uso de memoria a la mitad (apenas ~37MB)
+        matriz_vectores = np.array(vectores, dtype=np.float16)
+        del vectores
+        gc.collect()
+
+        normas = np.linalg.norm(matriz_vectores.astype(np.float32), axis=1, keepdims=True)
         normas[normas == 0] = 1.0
-        matriz_vectores /= normas
-        print(f"✅ R2 listo: {len(catalogo_metadatos)} obras y vectores en memoria.")
+        matriz_vectores = (matriz_vectores.astype(np.float32) / normas).astype(np.float16)
+        gc.collect()
+
+        print(f"✅ R2 listo: {len(catalogo_metadatos)} obras cargadas en memoria optimizada.")
     except Exception as e:
         print(f"❌ Error cargando R2: {e}")
     yield
@@ -171,12 +183,12 @@ def feed_ia_tendencias(
     if not filas_a_procesar:
         filas_a_procesar = [
             {"titulo": "Tendencias del Momento en México", "query": "lo más visto estrenos populares cine mexicano y streaming"},
-            {"titulo": "Terror y Misterio Sobrenatural", "query": "películas de terror horror espíritus demonios suspenso miedo"},
-            {"titulo": "Suspenso Psicológico y Tensión", "query": "thriller giros inesperados investigaciones oscuras crímenes"},
-            {"titulo": "Curiosidades, Enigmas y lo Oculto", "query": "misterios sin resolver secretos teorías fenómenos extraños"},
+            {"titulo": "Terror y Pesadillas Sobrenaturales", "query": "películas de terror horror espíritus demonios miedo"},
+            {"titulo": "Suspenso Psicológico y Tensión al Límite", "query": "thriller giros inesperados investigaciones oscuras crímenes"},
+            {"titulo": "Curiosidades, Enigmas y lo Oculto", "query": "misterios sin resolver secretos fenómenos extraños"},
             {"titulo": "Tecnología, Futuro e IA", "query": "ciencia ficción inteligencia artificial hackers robots distopías"},
-            {"titulo": "Ciencia Ficción y Espacio Exterior", "query": "naves espaciales planetas desconocidos agujeros de gusano galaxias"},
-            {"titulo": "Cine Ligero, Comedia y Familia", "query": "animación tierna aventuras humor risas historias optimistas"}
+            {"titulo": "Ciencia Ficción y Exploración Espacial", "query": "naves espaciales planetas desconocidos agujeros de gusano"},
+            {"titulo": "Comedia Ligera y Cine Familiar", "query": "animación tierna aventuras humor risas historias optimistas"}
         ]
 
     filas_paginadas = filas_a_procesar[offset : offset + limit]
