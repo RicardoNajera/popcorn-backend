@@ -1,8 +1,9 @@
 import os
 import gc
 import json
-import re
 import boto3
+import urllib.request
+import urllib.parse
 import numpy as np
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,12 +13,43 @@ R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET", "popcorn-cloud")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 catalogo_metadatos = []
+matriz_vectores = None
+
+def vectorizar_frase(texto: str):
+    """Convierte la descripción o frase del usuario a un vector de 768 dimensiones usando la API REST directa."""
+    if not GEMINI_API_KEY or not texto.strip():
+        print("⚠️ No hay GEMINI_API_KEY o el texto está vacío.")
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={GEMINI_API_KEY}"
+    
+    payload = json.dumps({
+        "model": "models/text-embedding-004",
+        "content": {
+            "parts": [{"text": texto.strip()}]
+        },
+        "taskType": "RETRIEVAL_QUERY"
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            valores = data.get("embedding", {}).get("values", [])
+            if valores:
+                vec = np.array(valores, dtype=np.float32)
+                norm = np.linalg.norm(vec)
+                return (vec / norm) if norm > 0 else vec
+    except Exception as e:
+        print(f"❌ Error al vectorizar frase con Google API: {e}")
+        return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global catalogo_metadatos
+    global catalogo_metadatos, matriz_vectores
 
     print("⏳ Conectando con Cloudflare R2...")
     try:
@@ -28,23 +60,33 @@ async def lifespan(app: FastAPI):
             aws_secret_access_key=R2_SECRET_KEY
         )
 
-        print("📥 Descargando metadatos.json...")
+        print("📥 Descargando metadatos.json y vectores.npz...")
         s3.download_file(R2_BUCKET, "metadatos.json", "/tmp/metadatos.json")
+        s3.download_file(R2_BUCKET, "vectores.npz", "/tmp/vectores.npz")
 
         with open("/tmp/metadatos.json", "r", encoding="utf-8") as f:
             catalogo_metadatos = json.load(f)
 
-        if os.path.exists("/tmp/metadatos.json"):
-            os.remove("/tmp/metadatos.json")
+        with np.load("/tmp/vectores.npz") as loaded:
+            matriz_vectores = loaded["vectors"].astype(np.float32)
+
+        # Normalizar matriz en memoria si no estuviera normalizada
+        normas = np.linalg.norm(matriz_vectores, axis=1, keepdims=True)
+        normas[normas == 0] = 1.0
+        matriz_vectores = matriz_vectores / normas
+
+        if os.path.exists("/tmp/metadatos.json"): os.remove("/tmp/metadatos.json")
+        if os.path.exists("/tmp/vectores.npz"): os.remove("/tmp/vectores.npz")
 
         gc.collect()
-        print(f"✅ R2 listo: {len(catalogo_metadatos)} obras cargadas en RAM.")
+        print(f"✅ R2 listo: {len(catalogo_metadatos)} obras y matriz {matriz_vectores.shape} cargada en RAM.")
     except Exception as e:
         print(f"❌ Error al iniciar R2: {e}")
     yield
 
 app = FastAPI(lifespan=lifespan)
 
+# CORS libre para conectar desde web, simulador o Smart TV
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,70 +95,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def limpiar_texto(t: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]', ' ', t.lower()).strip()
-
 @app.get("/")
 def home():
     return {
         "status": "online",
-        "obras_disponibles": len(catalogo_metadatos)
+        "servicio": "Popcorn Semantic Vector Engine",
+        "obras_en_ram": len(catalogo_metadatos),
+        "matriz_cargada": matriz_vectores is not None
     }
 
 @app.get("/api/buscar")
-def buscar(q: str = Query("", description="Texto de búsqueda")):
-    query_raw = q.strip()
-    if not query_raw or not catalogo_metadatos:
+def buscar_por_concepto(q: str = Query("", description="Frase o descripción semántica")):
+    query = q.strip()
+    if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    q_clean = limpiar_texto(query_raw)
-    palabras_query = [p for p in q_clean.split() if len(p) > 1]
-    if not palabras_query:
-        palabras_query = [q_clean]
+    print(f"🔍 Buscando concepto semántico: '{query}'")
 
-    # Calcular puntaje matemático de similitud para cada una de las 24,272 obras
-    scores = np.zeros(len(catalogo_metadatos), dtype=np.float32)
+    # 1. Obtener el vector de 768 números de la frase del usuario
+    v_query = vectorizar_frase(query)
+    if v_query is None:
+        print("⚠️ No se pudo generar vector de consulta. Retornando vacío.")
+        return []
 
-    for i, item in enumerate(catalogo_metadatos):
-        titulo = limpiar_texto(str(item.get("title", "")))
-        tipo = limpiar_texto(str(item.get("tipo", "")))
-        
-        texto_completo = f"{titulo} {tipo}"
-        score = 0.0
+    # 2. Producto punto contra las 24,272 obras (Similitud Coseno pura en C++)
+    similitudes = np.dot(matriz_vectores, v_query)
 
-        # Coincidencia de la frase completa
-        if q_clean in texto_completo:
-            score += 50.0
+    # 3. Extraer los 300 índices más cercanos
+    top_300_indices = np.argsort(similitudes)[::-1][:300]
+    if len(top_300_indices) == 0:
+        return []
 
-        # Coincidencias por palabra clave
-        for p in palabras_query:
-            if p in titulo.split():
-                score += 15.0  # Palabra exacta
-            elif p in titulo:
-                score += 5.0   # Subcadena
-
-        scores[i] = score
-
-    # Ordenar los índices de mayor a menor similitud
-    ranking = np.argsort(scores)[::-1][:300]
-
-    max_score = float(scores[ranking[0]])
-    
-    # Si la búsqueda no tuvo ninguna coincidencia exacta, max_score será 0
-    # En ese caso se toma un valor base para no dividir entre 0
-    divisor = max_score if max_score > 0 else 1.0
+    # El resultado más cercano marca la referencia máxima
+    max_sim = float(similitudes[top_300_indices[0]])
+    min_sim = float(similitudes[top_300_indices[-1]])
+    rango = (max_sim - min_sim) if max_sim > min_sim else 1.0
 
     resultados = []
-    for idx in ranking:
-        sc = float(scores[idx])
+    for idx in top_300_indices:
+        sim_val = float(similitudes[idx])
         
-        if max_score > 0:
-            pct = round((sc / divisor) * 100, 1)
-        else:
-            pct = 0.0
+        # Porcentaje relativo donde la #1 más cercana es 100% y de ahí degrada
+        pct = round(max(0.0, min(100.0, ((sim_val - min_sim) / rango) * 100)), 1)
 
         obra = dict(catalogo_metadatos[idx])
+        obra["score_coseno"] = round(sim_val, 4)
         obra["porcentaje"] = pct
         resultados.append(obra)
 
+    print(f"🎯 Encontradas {len(resultados)} obras. Coincidencia #1: {resultados[0].get('title')} ({max_sim:.4f})")
     return resultados
