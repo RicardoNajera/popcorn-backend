@@ -3,7 +3,7 @@ import gc
 import json
 import boto3
 import urllib.request
-import urllib.parse
+import urllib.error
 import numpy as np
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,38 +19,38 @@ catalogo_metadatos = []
 matriz_vectores = None
 
 def vectorizar_frase(texto: str):
-    """Convierte la descripción o frase del usuario a un vector de 768 dimensiones usando la API REST directa."""
-    if not GEMINI_API_KEY or not texto.strip():
-        print("⚠️ No hay GEMINI_API_KEY o el texto está vacío.")
-        return None
-
+    """Llama a Gemini. Si falla, retorna un TEXTO de error para mostrarlo en pantalla."""
+    if not GEMINI_API_KEY:
+        return "ERROR CRÍTICO: No agregaste la variable GEMINI_API_KEY en Render."
+        
     url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={GEMINI_API_KEY}"
-    
     payload = json.dumps({
         "model": "models/text-embedding-004",
         "content": {
             "parts": [{"text": texto.strip()}]
-        },
-        "taskType": "RETRIEVAL_QUERY"
+        }
     }).encode("utf-8")
-
+    
     try:
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
             valores = data.get("embedding", {}).get("values", [])
-            if valores:
-                vec = np.array(valores, dtype=np.float32)
-                norm = np.linalg.norm(vec)
-                return (vec / norm) if norm > 0 else vec
+            if not valores:
+                return "ERROR: Gemini respondió pero no entregó los números."
+            vec = np.array(valores, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            return (vec / norm) if norm > 0 else vec
+            
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8")
+        return f"RECHAZO DE GEMINI (HTTP {e.code}): {err_msg}"
     except Exception as e:
-        print(f"❌ Error al vectorizar frase con Google API: {e}")
-        return None
+        return f"ERROR INTERNO AL CONTACTAR GEMINI: {str(e)}"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global catalogo_metadatos, matriz_vectores
-
     print("⏳ Conectando con Cloudflare R2...")
     try:
         s3 = boto3.client(
@@ -59,8 +59,6 @@ async def lifespan(app: FastAPI):
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY
         )
-
-        print("📥 Descargando metadatos.json y vectores.npz...")
         s3.download_file(R2_BUCKET, "metadatos.json", "/tmp/metadatos.json")
         s3.download_file(R2_BUCKET, "vectores.npz", "/tmp/vectores.npz")
 
@@ -70,23 +68,21 @@ async def lifespan(app: FastAPI):
         with np.load("/tmp/vectores.npz") as loaded:
             matriz_vectores = loaded["vectors"].astype(np.float32)
 
-        # Normalizar matriz en memoria si no estuviera normalizada
+        # Normalizar para garantizar matemática precisa
         normas = np.linalg.norm(matriz_vectores, axis=1, keepdims=True)
         normas[normas == 0] = 1.0
         matriz_vectores = matriz_vectores / normas
 
         if os.path.exists("/tmp/metadatos.json"): os.remove("/tmp/metadatos.json")
         if os.path.exists("/tmp/vectores.npz"): os.remove("/tmp/vectores.npz")
-
         gc.collect()
-        print(f"✅ R2 listo: {len(catalogo_metadatos)} obras y matriz {matriz_vectores.shape} cargada en RAM.")
+        print(f"✅ R2 listo: {len(catalogo_metadatos)} obras en memoria RAM.")
     except Exception as e:
         print(f"❌ Error al iniciar R2: {e}")
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# CORS libre para conectar desde web, simulador o Smart TV
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -97,36 +93,34 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {
-        "status": "online",
-        "servicio": "Popcorn Semantic Vector Engine",
-        "obras_en_ram": len(catalogo_metadatos),
-        "matriz_cargada": matriz_vectores is not None
-    }
+    return {"status": "online", "matriz_lista": matriz_vectores is not None}
 
 @app.get("/api/buscar")
-def buscar_por_concepto(q: str = Query("", description="Frase o descripción semántica")):
+def buscar_por_concepto(q: str = Query("")):
     query = q.strip()
     if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    print(f"🔍 Buscando concepto semántico: '{query}'")
-
-    # 1. Obtener el vector de 768 números de la frase del usuario
+    # 1. Obtener los 768 números de tu frase
     v_query = vectorizar_frase(query)
-    if v_query is None:
-        print("⚠️ No se pudo generar vector de consulta. Retornando vacío.")
-        return []
+    
+    # 🚨 AQUÍ ESTÁ LA MAGIA DEL DEBUGGER VISUAL 🚨
+    # Si la variable es un texto, significa que falló. Lo mandamos a la pantalla.
+    if isinstance(v_query, str):
+        return [{
+            "title": v_query,
+            "poster": "https://images.unsplash.com/photo-1594322436404-5a0526db4d13?w=300",
+            "porcentaje": 0
+        }]
 
-    # 2. Producto punto contra las 24,272 obras (Similitud Coseno pura en C++)
+    # 2. Si no falló, hace la multiplicación matemática contra las 24,000 películas
     similitudes = np.dot(matriz_vectores, v_query)
-
-    # 3. Extraer los 300 índices más cercanos
+    
+    # 3. Trae el Top 300
     top_300_indices = np.argsort(similitudes)[::-1][:300]
     if len(top_300_indices) == 0:
         return []
 
-    # El resultado más cercano marca la referencia máxima
     max_sim = float(similitudes[top_300_indices[0]])
     min_sim = float(similitudes[top_300_indices[-1]])
     rango = (max_sim - min_sim) if max_sim > min_sim else 1.0
@@ -134,14 +128,10 @@ def buscar_por_concepto(q: str = Query("", description="Frase o descripción sem
     resultados = []
     for idx in top_300_indices:
         sim_val = float(similitudes[idx])
-        
-        # Porcentaje relativo donde la #1 más cercana es 100% y de ahí degrada
         pct = round(max(0.0, min(100.0, ((sim_val - min_sim) / rango) * 100)), 1)
-
         obra = dict(catalogo_metadatos[idx])
         obra["score_coseno"] = round(sim_val, 4)
         obra["porcentaje"] = pct
         resultados.append(obra)
 
-    print(f"🎯 Encontradas {len(resultados)} obras. Coincidencia #1: {resultados[0].get('title')} ({max_sim:.4f})")
     return resultados
