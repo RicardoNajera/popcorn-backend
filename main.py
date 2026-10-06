@@ -1,6 +1,7 @@
 import os
 import gc
 import json
+import re
 import boto3
 import numpy as np
 from fastapi import FastAPI, Query
@@ -20,9 +21,9 @@ matriz_vectores = None
 gemini_client = None
 
 def vectorizar_frase(texto: str):
-    """Obtiene el embedding y trunca de manera absoluta a 768 dimensiones."""
+    """Obtiene el embedding nativo de 768 dimensiones."""
     if not gemini_client:
-        return "ERROR: La variable GEMINI_API_KEY no está configurada o es inválida."
+        return "ERROR: Falta configurar GEMINI_API_KEY en Render."
         
     try:
         res = gemini_client.models.embed_content(
@@ -34,7 +35,6 @@ def vectorizar_frase(texto: str):
             )
         )
         
-        # Extraer valores de forma segura sin importar la estructura del objeto
         if hasattr(res, 'embeddings') and res.embeddings:
             valores = res.embeddings[0].values
         elif hasattr(res, 'embedding') and res.embedding:
@@ -43,8 +43,6 @@ def vectorizar_frase(texto: str):
             valores = res[0].values
 
         vec = np.array(valores, dtype=np.float32)
-
-        # CORTE DE SEGURIDAD ABSOLUTO: Forzar siempre 768 dimensiones
         if len(vec) > 768:
             vec = vec[:768]
 
@@ -61,7 +59,7 @@ async def lifespan(app: FastAPI):
         try:
             gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         except Exception as e:
-            print(f"Error iniciando cliente Gemini: {e}")
+            print(f"Error iniciando Gemini: {e}")
 
     print("⏳ Conectando con Cloudflare R2...")
     try:
@@ -114,7 +112,7 @@ def buscar_por_concepto(q: str = Query("")):
     if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    # 1. Obtener vector de consulta
+    # 1. Vectorizar la frase del usuario
     v_query = vectorizar_frase(query)
     
     if isinstance(v_query, str):
@@ -124,32 +122,40 @@ def buscar_por_concepto(q: str = Query("")):
             "porcentaje": 0
         }]
 
-    # 2. Doble validación de dimensiones estrictas (768 exactos)
     if len(v_query) != 768:
         v_query = v_query[:768]
         norm = np.linalg.norm(v_query)
         v_query = (v_query / norm) if norm > 0 else v_query
 
-    # 3. Multiplicación matricial limpia (24272, 768) x (768,)
+    # 2. Similitud Coseno Pura (Producto punto)
     similitudes = np.dot(matriz_vectores, v_query)
+
+    # 3. Refuerzo Híbrido por palabras clave explícitas (ej. "evelyn", "momia")
+    palabras_clave = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 3]
     
-    # 4. Top 300 resultados ordenados
+    for idx, item in enumerate(catalogo_metadatos):
+        titulo_lower = str(item.get("title", "")).lower()
+        # Si el título contiene alguna palabra clave importante de la búsqueda, le damos un empujón matemático
+        for palabra in palabras_clave:
+            if palabra in titulo_lower:
+                similitudes[idx] += 0.25 # Impulso de relevancia
+
+    # 4. Obtener el Top 300 real ordenado
     top_300_indices = np.argsort(similitudes)[::-1][:300]
     if len(top_300_indices) == 0:
         return []
 
-    max_sim = float(similitudes[top_300_indices[0]])
-    min_sim = float(similitudes[top_300_indices[-1]])
-    rango = (max_sim - min_sim) if max_sim > min_sim else 1.0
-
     resultados = []
     for idx in top_300_indices:
         sim_val = float(similitudes[idx])
-        pct = round(max(0.0, min(100.0, ((sim_val - min_sim) / rango) * 100)), 1)
         
+        # Porcentaje real basado en el coseno (del 0% al 100% de afinidad geométrica real)
+        # El coseno puro suele oscilar entre -0.1 y 0.85 en estos espacios vectoriales
+        pct_real = round(max(0.0, min(100.0, ((sim_val + 0.1) / 0.95) * 100)), 1)
+
         obra = dict(catalogo_metadatos[idx])
         obra["score_coseno"] = round(sim_val, 4)
-        obra["porcentaje"] = pct
+        obra["porcentaje"] = pct_real
         resultados.append(obra)
 
     return resultados
