@@ -20,39 +20,38 @@ matriz_vectores = None
 gemini_client = None
 
 def vectorizar_frase(texto: str):
-    """Convierte la frase del usuario a 768 números lidiando con los cambios de nombre de Google."""
+    """Obtiene el embedding y trunca de manera absoluta a 768 dimensiones."""
     if not gemini_client:
         return "ERROR: La variable GEMINI_API_KEY no está configurada o es inválida."
         
     try:
-        # Intento 1: Nombre original
         res = gemini_client.models.embed_content(
-            model="text-embedding-004",
+            model="gemini-embedding-001",
             contents=texto.strip(),
-            config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY",
+                output_dimensionality=768
+            )
         )
-        valores = res.embeddings[0].values
+        
+        # Extraer valores de forma segura sin importar la estructura del objeto
+        if hasattr(res, 'embeddings') and res.embeddings:
+            valores = res.embeddings[0].values
+        elif hasattr(res, 'embedding') and res.embedding:
+            valores = res.embedding.values
+        else:
+            valores = res[0].values
+
         vec = np.array(valores, dtype=np.float32)
+
+        # CORTE DE SEGURIDAD ABSOLUTO: Forzar siempre 768 dimensiones
+        if len(vec) > 768:
+            vec = vec[:768]
+
         norm = np.linalg.norm(vec)
         return (vec / norm) if norm > 0 else vec
-        
     except Exception as e:
-        error_str = str(e)
-        # Si Google nos da un 404, cambiamos de inmediato al nombre moderno
-        if "404" in error_str or "not found" in error_str.lower():
-            try:
-                res = gemini_client.models.embed_content(
-                    model="gemini-embedding-001",
-                    contents=texto.strip(),
-                    config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
-                )
-                valores = res.embeddings[0].values
-                vec = np.array(valores, dtype=np.float32)
-                norm = np.linalg.norm(vec)
-                return (vec / norm) if norm > 0 else vec
-            except Exception as e2:
-                return f"ERROR CRÍTICO (Gemini rechazó ambos modelos): {str(e2)}"
-        return f"ERROR GEMINI: {error_str}"
+        return f"ERROR GEMINI: {str(e)}"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,7 +81,7 @@ async def lifespan(app: FastAPI):
         with np.load("/tmp/vectores.npz") as loaded:
             matriz_vectores = loaded["vectors"].astype(np.float32)
 
-        # Garantizar matemática precisa (Módulo 1)
+        # Normalizar matriz en memoria
         normas = np.linalg.norm(matriz_vectores, axis=1, keepdims=True)
         normas[normas == 0] = 1.0
         matriz_vectores = matriz_vectores / normas
@@ -90,7 +89,7 @@ async def lifespan(app: FastAPI):
         if os.path.exists("/tmp/metadatos.json"): os.remove("/tmp/metadatos.json")
         if os.path.exists("/tmp/vectores.npz"): os.remove("/tmp/vectores.npz")
         gc.collect()
-        print(f"✅ Catálogo listo: {len(catalogo_metadatos)} obras y matriz vectorial en RAM.")
+        print(f"✅ Catálogo listo: {len(catalogo_metadatos)} obras y matriz {matriz_vectores.shape} en RAM.")
     except Exception as e:
         print(f"❌ Error al iniciar R2: {e}")
     yield
@@ -115,10 +114,9 @@ def buscar_por_concepto(q: str = Query("")):
     if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    # 1. Convierte el concepto a 768 números
+    # 1. Obtener vector de consulta
     v_query = vectorizar_frase(query)
     
-    # 🚨 Chivato Visual de Errores 🚨
     if isinstance(v_query, str):
         return [{
             "title": v_query,
@@ -126,10 +124,16 @@ def buscar_por_concepto(q: str = Query("")):
             "porcentaje": 0
         }]
 
-    # 2. Búsqueda instantánea en RAM (El milagro matemático de 0.05 segundos)
+    # 2. Doble validación de dimensiones estrictas (768 exactos)
+    if len(v_query) != 768:
+        v_query = v_query[:768]
+        norm = np.linalg.norm(v_query)
+        v_query = (v_query / norm) if norm > 0 else v_query
+
+    # 3. Multiplicación matricial limpia (24272, 768) x (768,)
     similitudes = np.dot(matriz_vectores, v_query)
     
-    # 3. Trae el Top 300
+    # 4. Top 300 resultados ordenados
     top_300_indices = np.argsort(similitudes)[::-1][:300]
     if len(top_300_indices) == 0:
         return []
@@ -141,7 +145,6 @@ def buscar_por_concepto(q: str = Query("")):
     resultados = []
     for idx in top_300_indices:
         sim_val = float(similitudes[idx])
-        # Escala: 100% la más precisa, hacia abajo el resto
         pct = round(max(0.0, min(100.0, ((sim_val - min_sim) / rango) * 100)), 1)
         
         obra = dict(catalogo_metadatos[idx])
