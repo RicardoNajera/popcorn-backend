@@ -93,36 +93,52 @@ def home():
 @app.get("/api/buscar")
 def buscar_vectorial(q: str = Query("", description="Texto de búsqueda")):
     query = q.strip()
-    if not query or not catalogo_metadatos or matriz_vectores is None:
+    if not query or not catalogo_metadatos:
         return []
 
-    # 1. Obtener vector de la consulta
+    # 1. Si no hay vectores cargados, fallback por coincidencia de texto
+    if matriz_vectores is None:
+        coincidencias = [
+            dict(item, porcentaje=100.0) 
+            for item in catalogo_metadatos 
+            if query.lower() in str(item.get("title", "")).lower()
+        ]
+        return coincidencias[:300]
+
+    # 2. Vectorizar la consulta
     v_query = obtener_vector_query(query)
     if v_query is None:
-        return []
+        coincidencias = [
+            dict(item, porcentaje=100.0) 
+            for item in catalogo_metadatos 
+            if query.lower() in str(item.get("title", "")).lower()
+        ]
+        return coincidencias[:300]
 
-    # 2. Calcular producto punto (similitud coseno) contra las 24,272 obras
+    # 3. Similitud coseno contra las 24,272 obras
     similitudes = np.dot(matriz_vectores.astype(np.float32), v_query.astype(np.float32))
 
-    # 3. Extraer el top 300
+    # Top 300
     top_indices = np.argsort(similitudes)[::-1][:300]
-    
-    max_sim = float(similitudes[top_indices[0]]) if len(top_indices) > 0 else 1.0
+    if len(top_indices) == 0:
+        return []
+
+    max_sim = float(similitudes[top_indices[0]])
+    min_sim = float(similitudes[top_indices[-1]])
+    rango = max_sim - min_sim if max_sim > min_sim else 1.0
 
     resultados = []
     for idx in top_indices:
         sim_val = float(similitudes[idx])
-
-        # Escalar a porcentaje relativo al mejor resultado o valor absoluto de coseno
-        if max_sim > 0.05:
-            score_normalizado = max(0.0, sim_val / max_sim)
+        
+        # Escala: El resultado #1 siempre es 100%, y va degradando hacia abajo según la distancia
+        if max_sim > 0:
+            porcentaje = round(max(0.0, min(100.0, ((sim_val - min_sim) / rango) * 100)), 1)
         else:
-            score_normalizado = max(0.0, sim_val)
-
-        porcentaje = round(score_normalizado * 100, 1)
+            porcentaje = 0.0
 
         obra = dict(catalogo_metadatos[idx])
-        obra["similitud"] = round(sim_val, 4)
+        obra["similitud_raw"] = round(sim_val, 4)
         obra["porcentaje"] = porcentaje
         resultados.append(obra)
 
