@@ -26,7 +26,6 @@ async def lifespan(app: FastAPI):
             aws_secret_access_key=R2_SECRET_KEY
         )
 
-        # Nombre actualizado exactamente al que subiste a R2
         s3.download_file(R2_BUCKET, "iptv_database_structured.json", "/tmp/iptv_database_structured.json")
 
         with open("/tmp/iptv_database_structured.json", "r", encoding="utf-8") as f:
@@ -61,64 +60,19 @@ def obtener_seccion(tipo: str = "Televisión"):
     if not catalogo_global:
         return {}
 
+    # Mapeo directo y seguro de llaves exactas para evitar bucles lentos
     tipo_limpio = tipo.strip().lower()
     seccion = None
     
     for k, v in catalogo_global.items():
-        k_limpio = k.strip().lower()
-        if k_limpio == tipo_limpio or tipo_limpio in k:
+        if k.strip().lower() == tipo_limpio:
             seccion = v
             break
             
-    if not seccion and catalogo_global:
+    if not seccion:
+        # Fallback a la primera sección disponible si no coincide exacto
         primera_key = list(catalogo_global.keys())[0]
         seccion = catalogo_global[primera_key]
 
-    resultado_normalizado = {}
-
-    if isinstance(seccion, dict):
-        primera_val = next(iter(seccion.values())) if seccion else None
-        
-        if isinstance(primera_val, list):
-            for row_name, items in seccion.items():
-                lista_limpia = []
-                if isinstance(items, list):
-                    for item in items:
-                        if isinstance(item, dict):
-                            lista_limpia.append({
-                                "title": str(item.get("title", "")),
-                                "logo": str(item.get("logo", "")),
-                                "url": str(item.get("url", ""))
-                            })
-                if lista_limpia:
-                    resultado_normalizado[str(row_name)] = lista_limpia
-                    
-        elif isinstance(primera_val, dict):
-            for serie_name, temporadas in seccion.items():
-                if isinstance(temporadas, dict):
-                    for temp_name, eps in temporadas.items():
-                        if isinstance(eps, list):
-                            row_title = f"{serie_name} - {temp_name}"
-                            lista_eps = []
-                            for ep in eps:
-                                if isinstance(ep, dict):
-                                    lista_eps.append({
-                                        "title": str(ep.get("title", "")),
-                                        "logo": str(ep.get("logo", "")),
-                                        "url": str(ep.get("url", ""))
-                                    })
-                            if lista_eps:
-                                resultado_normalizado[row_title] = lista_eps
-    elif isinstance(seccion, list):
-        lista_limpia = []
-        for item in seccion:
-            if isinstance(item, dict):
-                lista_limpia.append({
-                    "title": str(item.get("title", "")),
-                    "logo": str(item.get("logo", "")),
-                    "url": str(item.get("url", ""))
-                })
-        if lista_limpia:
-            resultado_normalizado[tipo] = lista_limpia
-
-    return resultado_normalizado
+    # Retorno directo sin procesamiento pesado al vuelo (el JSON ya viene estructurado de origen)
+    return seccion if isinstance(seccion, dict) else {tipo: seccion}
