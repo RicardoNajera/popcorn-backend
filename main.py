@@ -21,7 +21,7 @@ matriz_vectores = None
 gemini_client = None
 
 def vectorizar_texto(texto: str):
-    """Convierte un texto (título o sugerencia de la IA) a vector de 768 dimensiones."""
+    """Convierte un texto a vector de 768 dimensiones."""
     if not gemini_client or not texto.strip():
         return None
     try:
@@ -44,7 +44,7 @@ def vectorizar_texto(texto: str):
         return None
 
 def interpretar_con_gemini(query: str):
-    """Paso 1: Gemini interpreta la intención del usuario y devuelve una lista de títulos ideales."""
+    """Paso 1: Gemini interpreta la intención usando el modelo gemini-3.5-flash."""
     if not gemini_client:
         return [query]
     try:
@@ -53,18 +53,18 @@ def interpretar_con_gemini(query: str):
             "Actúa como un experto en cine y televisión. Extrae o deduce una lista de hasta 10 títulos reales de películas, series o canales (en español e inglés) que correspondan exactamente a lo que busca. "
             "Responde ÚNICAMENTE con los títulos separados por comas, sin numeración ni texto adicional."
         )
+        # Usamos gemini-3.5-flash como solicitaste
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.5-flash",
             contents=prompt,
         )
         texto_resp = response.text.strip()
         sugerencias = [s.strip() for s in re.split(r'[\n,]+', texto_resp) if s.strip()]
         
-        # Incluir también la consulta original por seguridad
         if query not in sugerencias:
             sugerencias.insert(0, query)
             
-        return sugerencias[:10] # Tomar hasta 10 sugerencias clave de Gemini
+        return sugerencias[:10]
     except Exception as e:
         print(f"Aviso en interpretación de Gemini: {e}")
         return [query]
@@ -130,32 +130,31 @@ def buscar(q: str = Query("")):
     if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    # PASO 1: Gemini interpreta la búsqueda y sugiere títulos ideales
+    # PASO 1: Gemini (3.5-flash) interpreta la búsqueda y sugiere títulos ideales
     titulos_sugeridos = interpretar_con_gemini(query)
 
-    # PASO 2: Cruzar las sugerencias de Gemini contra la matriz vectorial en la RAM de Render
+    # PASO 2: Cruzar las sugerencias contra la matriz vectorial en la RAM
     similitudes_totales = np.zeros(len(catalogo_metadatos), dtype=np.float32)
 
     for titulo in titulos_sugeridos:
         v_query = vectorizar_texto(titulo)
         if v_query is not None:
             sims = np.dot(matriz_vectores, v_query)
-            similitudes_totales = np.maximum(similitudes_totales, sims) # Nos quedamos con la máxima afinidad encontrada
+            similitudes_totales = np.maximum(similitudes_totales, sims)
 
-    # PASO 3: Impulso por palabras clave directas (para rescatar nombres recortados o mal escritos como "Big Bang")
+    # PASO 3: Impulso por palabras clave directas
     palabras_query = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 2]
     for idx, item in enumerate(catalogo_metadatos):
         titulo_lower = str(item.get("title", "")).lower()
         for palabra in palabras_query:
             if palabra in titulo_lower:
-                similitudes_totales[idx] += 0.25 # Bonus para asegurar el match en nombres cortos
+                similitudes_totales[idx] += 0.25
 
     # PASO 4: Obtener exactamente los mejores 50 resultados ordenados
     top_50_indices = np.argsort(similitudes_totales)[::-1][:50]
     if len(top_50_indices) == 0:
         return []
 
-    # Encontrar la puntuación máxima para calibrar el 100% de precisión relativa
     max_score = float(similitudes_totales[top_50_indices[0]])
     min_score = float(similitudes_totales[top_50_indices[-1]])
     rango = (max_score - min_score) if max_score > min_score else 1.0
@@ -164,10 +163,8 @@ def buscar(q: str = Query("")):
     for idx in top_50_indices:
         sim_val = float(similitudes_totales[idx])
         
-        # Cálculo del porcentaje calibrado: El mejor resultado de todos marca el estándar de precisión
         if max_score > 0:
             pct = round(max(0.0, min(100.0, ((sim_val - min_score) / rango) * 100 if rango > 0 else 100.0)), 1)
-            # Si el puntaje es extremadamente alto, aseguramos que el primero marque el tope cercano a la realidad
             if sim_val == max_score:
                 pct = 100.0
         else:
