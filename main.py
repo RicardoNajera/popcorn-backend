@@ -43,29 +43,30 @@ def vectorizar_texto(texto: str):
         print(f"Error vectorizando texto: {e}")
         return None
 
-def expandir_con_gemini(query: str):
-    """Usa Gemini brevemente para traducir actores, tramas o descripciones a títulos reales de películas/series."""
+def interpretar_con_gemini(query: str):
+    """Paso 1: Gemini interpreta la intención del usuario y devuelve una lista de títulos ideales."""
     if not gemini_client:
         return [query]
     try:
         prompt = (
-            f"El usuario busca: '{query}'. "
-            "Si es un actor, director o descripción de trama, extrae los 3 o 4 títulos de películas o series más representativos en inglés y español. "
-            "Responde ÚNICAMENTE con los títulos separados por comas, sin explicaciones ni saludos."
+            f"El usuario busca en su catálogo de películas/series: '{query}'. "
+            "Actúa como un experto en cine y televisión. Extrae o deduce una lista de hasta 10 títulos reales de películas, series o canales (en español e inglés) que correspondan exactamente a lo que busca. "
+            "Responde ÚNICAMENTE con los títulos separados por comas, sin numeración ni texto adicional."
         )
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
         )
         texto_resp = response.text.strip()
-        # Separar por comas o saltos de línea
         sugerencias = [s.strip() for s in re.split(r'[\n,]+', texto_resp) if s.strip()]
-        # Siempre incluimos la consulta original por si acaso
+        
+        # Incluir también la consulta original por seguridad
         if query not in sugerencias:
             sugerencias.insert(0, query)
-        return sugerencias[:4] # Tomar hasta 4 variaciones clave
+            
+        return sugerencias[:10] # Tomar hasta 10 sugerencias clave de Gemini
     except Exception as e:
-        print(f"Aviso en expansión de Gemini: {e}")
+        print(f"Aviso en interpretación de Gemini: {e}")
         return [query]
 
 @asynccontextmanager
@@ -129,39 +130,48 @@ def buscar(q: str = Query("")):
     if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    # 1. Si la consulta parece una descripción o actor (contiene espacios o no es un título plano), expandimos con Gemini
-    if " " in query or len(query) > 12:
-        variaciones = expandir_con_gemini(query)
-    else:
-        variaciones = [query]
+    # PASO 1: Gemini interpreta la búsqueda y sugiere títulos ideales
+    titulos_sugeridos = interpretar_con_gemini(query)
 
-    # 2. Vectorizar la consulta principal o sus expansiones y acumular similitudes
+    # PASO 2: Cruzar las sugerencias de Gemini contra la matriz vectorial en la RAM de Render
     similitudes_totales = np.zeros(len(catalogo_metadatos), dtype=np.float32)
 
-    for var in variaciones:
-        v_query = vectorizar_texto(var)
+    for titulo in titulos_sugeridos:
+        v_query = vectorizar_texto(titulo)
         if v_query is not None:
             sims = np.dot(matriz_vectores, v_query)
-            similitudes_totales = np.maximum(similitudes_totales, sims) # Quedarse con la mejor coincidencia de las variantes
+            similitudes_totales = np.maximum(similitudes_totales, sims) # Nos quedamos con la máxima afinidad encontrada
 
-    # 3. Impulso híbrido por palabras clave directas en el título (para nombres cortos como "Big Bang")
+    # PASO 3: Impulso por palabras clave directas (para rescatar nombres recortados o mal escritos como "Big Bang")
     palabras_query = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 2]
     for idx, item in enumerate(catalogo_metadatos):
         titulo_lower = str(item.get("title", "")).lower()
         for palabra in palabras_query:
             if palabra in titulo_lower:
-                similitudes_totales[idx] += 0.20 # Bonus por match de texto directo
+                similitudes_totales[idx] += 0.25 # Bonus para asegurar el match en nombres cortos
 
-    # 4. Obtener exactamente los primeros 50 resultados
+    # PASO 4: Obtener exactamente los mejores 50 resultados ordenados
     top_50_indices = np.argsort(similitudes_totales)[::-1][:50]
     if len(top_50_indices) == 0:
         return []
 
+    # Encontrar la puntuación máxima para calibrar el 100% de precisión relativa
+    max_score = float(similitudes_totales[top_50_indices[0]])
+    min_score = float(similitudes_totales[top_50_indices[-1]])
+    rango = (max_score - min_score) if max_score > min_score else 1.0
+
     resultados = []
     for idx in top_50_indices:
         sim_val = float(similitudes_totales[idx])
-        # Calcular porcentaje real basado en el coseno
-        pct = round(max(0.0, min(100.0, ((sim_val + 0.1) / 0.95) * 100)), 1)
+        
+        # Cálculo del porcentaje calibrado: El mejor resultado de todos marca el estándar de precisión
+        if max_score > 0:
+            pct = round(max(0.0, min(100.0, ((sim_val - min_score) / rango) * 100 if rango > 0 else 100.0)), 1)
+            # Si el puntaje es extremadamente alto, aseguramos que el primero marque el tope cercano a la realidad
+            if sim_val == max_score:
+                pct = 100.0
+        else:
+            pct = 0.0
 
         obra = dict(catalogo_metadatos[idx])
         obra["score_coseno"] = round(sim_val, 4)
