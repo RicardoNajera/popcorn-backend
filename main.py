@@ -20,11 +20,10 @@ catalogo_metadatos = []
 matriz_vectores = None
 gemini_client = None
 
-def vectorizar_frase(texto: str):
-    """Obtiene el embedding nativo de 768 dimensiones."""
-    if not gemini_client:
-        return "ERROR: Falta configurar GEMINI_API_KEY en Render."
-        
+def vectorizar_texto(texto: str):
+    """Convierte un texto (título o sugerencia de la IA) a vector de 768 dimensiones."""
+    if not gemini_client or not texto.strip():
+        return None
     try:
         res = gemini_client.models.embed_content(
             model="gemini-embedding-001",
@@ -34,22 +33,40 @@ def vectorizar_frase(texto: str):
                 output_dimensionality=768
             )
         )
-        
-        if hasattr(res, 'embeddings') and res.embeddings:
-            valores = res.embeddings[0].values
-        elif hasattr(res, 'embedding') and res.embedding:
-            valores = res.embedding.values
-        else:
-            valores = res[0].values
-
+        valores = res.embeddings[0].values
         vec = np.array(valores, dtype=np.float32)
         if len(vec) > 768:
             vec = vec[:768]
-
         norm = np.linalg.norm(vec)
         return (vec / norm) if norm > 0 else vec
     except Exception as e:
-        return f"ERROR GEMINI: {str(e)}"
+        print(f"Error vectorizando texto: {e}")
+        return None
+
+def expandir_con_gemini(query: str):
+    """Usa Gemini brevemente para traducir actores, tramas o descripciones a títulos reales de películas/series."""
+    if not gemini_client:
+        return [query]
+    try:
+        prompt = (
+            f"El usuario busca: '{query}'. "
+            "Si es un actor, director o descripción de trama, extrae los 3 o 4 títulos de películas o series más representativos en inglés y español. "
+            "Responde ÚNICAMENTE con los títulos separados por comas, sin explicaciones ni saludos."
+        )
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        texto_resp = response.text.strip()
+        # Separar por comas o saltos de línea
+        sugerencias = [s.strip() for s in re.split(r'[\n,]+', texto_resp) if s.strip()]
+        # Siempre incluimos la consulta original por si acaso
+        if query not in sugerencias:
+            sugerencias.insert(0, query)
+        return sugerencias[:4] # Tomar hasta 4 variaciones clave
+    except Exception as e:
+        print(f"Aviso en expansión de Gemini: {e}")
+        return [query]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,7 +76,7 @@ async def lifespan(app: FastAPI):
         try:
             gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         except Exception as e:
-            print(f"Error iniciando Gemini: {e}")
+            print(f"Error iniciando cliente Gemini: {e}")
 
     print("⏳ Conectando con Cloudflare R2...")
     try:
@@ -107,55 +124,48 @@ def home():
     return {"status": "online", "matriz_lista": matriz_vectores is not None}
 
 @app.get("/api/buscar")
-def buscar_por_concepto(q: str = Query("")):
+def buscar(q: str = Query("")):
     query = q.strip()
     if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    # 1. Vectorizar la frase del usuario
-    v_query = vectorizar_frase(query)
-    
-    if isinstance(v_query, str):
-        return [{
-            "title": v_query,
-            "poster": "https://images.unsplash.com/photo-1594322436404-5a0526db4d13?w=300",
-            "porcentaje": 0
-        }]
+    # 1. Si la consulta parece una descripción o actor (contiene espacios o no es un título plano), expandimos con Gemini
+    if " " in query or len(query) > 12:
+        variaciones = expandir_con_gemini(query)
+    else:
+        variaciones = [query]
 
-    if len(v_query) != 768:
-        v_query = v_query[:768]
-        norm = np.linalg.norm(v_query)
-        v_query = (v_query / norm) if norm > 0 else v_query
+    # 2. Vectorizar la consulta principal o sus expansiones y acumular similitudes
+    similitudes_totales = np.zeros(len(catalogo_metadatos), dtype=np.float32)
 
-    # 2. Similitud Coseno Pura (Producto punto)
-    similitudes = np.dot(matriz_vectores, v_query)
+    for var in variaciones:
+        v_query = vectorizar_texto(var)
+        if v_query is not None:
+            sims = np.dot(matriz_vectores, v_query)
+            similitudes_totales = np.maximum(similitudes_totales, sims) # Quedarse con la mejor coincidencia de las variantes
 
-    # 3. Refuerzo Híbrido por palabras clave explícitas (ej. "evelyn", "momia")
-    palabras_clave = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 3]
-    
+    # 3. Impulso híbrido por palabras clave directas en el título (para nombres cortos como "Big Bang")
+    palabras_query = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 2]
     for idx, item in enumerate(catalogo_metadatos):
         titulo_lower = str(item.get("title", "")).lower()
-        # Si el título contiene alguna palabra clave importante de la búsqueda, le damos un empujón matemático
-        for palabra in palabras_clave:
+        for palabra in palabras_query:
             if palabra in titulo_lower:
-                similitudes[idx] += 0.25 # Impulso de relevancia
+                similitudes_totales[idx] += 0.20 # Bonus por match de texto directo
 
-    # 4. Obtener el Top 300 real ordenado
-    top_300_indices = np.argsort(similitudes)[::-1][:300]
-    if len(top_300_indices) == 0:
+    # 4. Obtener exactamente los primeros 50 resultados
+    top_50_indices = np.argsort(similitudes_totales)[::-1][:50]
+    if len(top_50_indices) == 0:
         return []
 
     resultados = []
-    for idx in top_300_indices:
-        sim_val = float(similitudes[idx])
-        
-        # Porcentaje real basado en el coseno (del 0% al 100% de afinidad geométrica real)
-        # El coseno puro suele oscilar entre -0.1 y 0.85 en estos espacios vectoriales
-        pct_real = round(max(0.0, min(100.0, ((sim_val + 0.1) / 0.95) * 100)), 1)
+    for idx in top_50_indices:
+        sim_val = float(similitudes_totales[idx])
+        # Calcular porcentaje real basado en el coseno
+        pct = round(max(0.0, min(100.0, ((sim_val + 0.1) / 0.95) * 100)), 1)
 
         obra = dict(catalogo_metadatos[idx])
         obra["score_coseno"] = round(sim_val, 4)
-        obra["porcentaje"] = pct_real
+        obra["porcentaje"] = pct
         resultados.append(obra)
 
     return resultados
