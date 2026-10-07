@@ -21,7 +21,6 @@ matriz_vectores = None
 gemini_client = None
 
 def vectorizar_texto_seguro(texto: str):
-    """Vectoriza un texto de forma individual y segura para evitar bloqueos."""
     if not gemini_client or not texto.strip():
         return None
     try:
@@ -44,15 +43,15 @@ def vectorizar_texto_seguro(texto: str):
         return None
 
 def interpretar_intencion_con_gemini(query: str):
-    """Paso 1: Gemini (3.5-flash) interpreta la intención y devuelve títulos clave."""
+    """Interpreta la intención y devuelve lista limpia y el texto crudo para depurar."""
     if not gemini_client:
-        return [query]
+        return [query], "Gemini no inicializado"
     try:
         prompt = (
-            f"El usuario busca en su catálogo: '{query}'. "
-            "Comprende la intención (género, actor, trama o emoción). "
-            "Devuelve una lista de hasta 8 títulos reales de películas o series representativas en inglés y español. "
-            "Responde ÚNICAMENTE con los títulos separados por comas, sin explicaciones ni numeración."
+            f"El usuario busca: '{query}'. "
+            "Comprende la intención profunda (género, actor, trama, estado de ánimo o nombre directo). "
+            "Devuelve una lista de hasta 5 títulos clave de películas, series o canales ideales en inglés y español. "
+            "Responde ÚNICAMENTE con los títulos separados por comas, sin explicaciones."
         )
         response = gemini_client.models.generate_content(
             model="gemini-3.5-flash",
@@ -64,10 +63,9 @@ def interpretar_intencion_con_gemini(query: str):
         if query not in sugerencias:
             sugerencias.insert(0, query)
             
-        return sugerencias[:8]
+        return sugerencias[:5], texto_resp
     except Exception as e:
-        print(f"Aviso en Gemini: {e}")
-        return [query]
+        return [query], f"Error Gemini: {str(e)}"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -77,7 +75,7 @@ async def lifespan(app: FastAPI):
         try:
             gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         except Exception as e:
-            print(f"Error iniciando cliente Gemini: {e}")
+            print(f"Error iniciando Gemini: {e}")
 
     print("⏳ Conectando con Cloudflare R2...")
     try:
@@ -97,7 +95,6 @@ async def lifespan(app: FastAPI):
         with np.load("/tmp/vectores.npz") as loaded:
             matriz_vectores = loaded["vectors"].astype(np.float32)
 
-        # Normalizar matriz en memoria
         normas = np.linalg.norm(matriz_vectores, axis=1, keepdims=True)
         normas[normas == 0] = 1.0
         matriz_vectores = matriz_vectores / normas
@@ -128,12 +125,12 @@ def home():
 def buscar(q: str = Query("")):
     query = q.strip()
     if not query or not catalogo_metadatos or matriz_vectores is None:
-        return []
+        return {"gemini_debug": "Catálogo no listo o query vacía", "resultados": []}
 
-    # 1. Gemini interpreta la intención
-    titulos_a_buscar = interpretar_intencion_con_gemini(query)
+    # 1. Gemini interpreta y nos da el texto crudo para depurar
+    titulos_a_buscar, debug_gemini = interpretar_intencion_con_gemini(query)
 
-    # 2. Cruzar cada sugerencia contra la matriz en RAM
+    # 2. Vectorizar y cruzar con la matriz en RAM
     similitudes_totales = np.zeros(len(catalogo_metadatos), dtype=np.float32)
 
     for titulo in titulos_a_buscar:
@@ -142,25 +139,25 @@ def buscar(q: str = Query("")):
             sims = np.dot(matriz_vectores, v_query)
             similitudes_totales = np.maximum(similitudes_totales, sims)
 
-    # 3. Impulso extra para nombres cortos o mal escritos (ej. "Big Bang")
+    # 3. Impulso extra para nombres directos
     palabras_query = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 2]
     for idx, item in enumerate(catalogo_metadatos):
         titulo_lower = str(item.get("title", "")).lower()
         for palabra in palabras_query:
             if palabra in titulo_lower:
-                similitudes_totales[idx] += 0.20
+                similitudes_totales[idx] += 0.30 # Mayor impulso para asegurar coincidencia directa
 
-    # 4. Obtener exactamente los mejores 50 resultados ordenados
-    top_50_indices = np.argsort(similitudes_totales)[::-1][:50]
-    if len(top_50_indices) == 0:
-        return []
+    # 4. Obtener EXACTAMENTE los mejores 10 resultados
+    top_10_indices = np.argsort(similitudes_totales)[::-1][:10]
+    if len(top_10_indices) == 0:
+        return {"gemini_debug": debug_gemini, "resultados": []}
 
-    max_score = float(similitudes_totales[top_50_indices[0]])
-    min_score = float(similitudes_totales[top_50_indices[-1]])
+    max_score = float(similitudes_totales[top_10_indices[0]])
+    min_score = float(similitudes_totales[top_10_indices[-1]])
     rango = (max_score - min_score) if max_score > min_score else 1.0
 
     resultados = []
-    for idx in top_50_indices:
+    for idx in top_10_indices:
         sim_val = float(similitudes_totales[idx])
         
         if max_score > 0:
@@ -175,4 +172,8 @@ def buscar(q: str = Query("")):
         obra["porcentaje"] = pct
         resultados.append(obra)
 
-    return resultados
+    return {
+        "gemini_debug": debug_gemini,
+        "titulos_interpretados": titulos_a_buscar,
+        "resultados": resultados
+    }
