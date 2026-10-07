@@ -20,45 +20,38 @@ catalogo_metadatos = []
 matriz_vectores = None
 gemini_client = None
 
-def vectorizar_texto_batch(textos: list[str]):
-    """Vectoriza una lista de textos de manera eficiente."""
-    if not gemini_client or not textos:
-        return []
-    
-    vectores = []
-    for texto in textos:
-        if not texto.strip():
-            continue
-        try:
-            res = gemini_client.models.embed_content(
-                model="gemini-embedding-001",
-                contents=texto.strip(),
-                config=types.EmbedContentConfig(
-                    task_type="RETRIEVAL_QUERY",
-                    output_dimensionality=768
-                )
+def vectorizar_texto_seguro(texto: str):
+    """Vectoriza un texto de forma individual y segura para evitar bloqueos."""
+    if not gemini_client or not texto.strip():
+        return None
+    try:
+        res = gemini_client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=texto.strip(),
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY",
+                output_dimensionality=768
             )
-            valores = res.embeddings[0].values
-            vec = np.array(valores, dtype=np.float32)
-            if len(vec) > 768:
-                vec = vec[:768]
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            vectores.append(vec)
-        except Exception as e:
-            print(f"Error vectorizando '{texto}': {e}")
-    return vectores
+        )
+        valores = res.embeddings[0].values
+        vec = np.array(valores, dtype=np.float32)
+        if len(vec) > 768:
+            vec = vec[:768]
+        norm = np.linalg.norm(vec)
+        return (vec / norm) if norm > 0 else vec
+    except Exception as e:
+        print(f"Aviso al vectorizar '{texto}': {e}")
+        return None
 
 def interpretar_intencion_con_gemini(query: str):
-    """Interpreta estados de ánimo, descripciones o actores y devuelve hasta 10 títulos clave en un solo paso."""
+    """Paso 1: Gemini (3.5-flash) interpreta la intención y devuelve títulos clave."""
     if not gemini_client:
         return [query]
     try:
         prompt = (
-            f"El usuario busca contenido en su catálogo con esta frase o estado de ánimo: '{query}'. "
-            "Comprende la intención profunda (si busca un género, un actor, una trama o una emoción). "
-            "Devuelve una lista de hasta 10 títulos reales de películas, series o animes más representativos que cumplan con esto (en inglés y español). "
+            f"El usuario busca en su catálogo: '{query}'. "
+            "Comprende la intención (género, actor, trama o emoción). "
+            "Devuelve una lista de hasta 8 títulos reales de películas o series representativas en inglés y español. "
             "Responde ÚNICAMENTE con los títulos separados por comas, sin explicaciones ni numeración."
         )
         response = gemini_client.models.generate_content(
@@ -68,11 +61,10 @@ def interpretar_intencion_con_gemini(query: str):
         texto_resp = response.text.strip()
         sugerencias = [s.strip() for s in re.split(r'[\n,]+', texto_resp) if s.strip()]
         
-        # Asegurar que la consulta original siempre esté incluida por si acaso
         if query not in sugerencias:
             sugerencias.insert(0, query)
             
-        return sugerencias[:10]
+        return sugerencias[:8]
     except Exception as e:
         print(f"Aviso en Gemini: {e}")
         return [query]
@@ -105,7 +97,7 @@ async def lifespan(app: FastAPI):
         with np.load("/tmp/vectores.npz") as loaded:
             matriz_vectores = loaded["vectors"].astype(np.float32)
 
-        # Normalizar matriz en memoria para velocidad absoluta
+        # Normalizar matriz en memoria
         normas = np.linalg.norm(matriz_vectores, axis=1, keepdims=True)
         normas[normas == 0] = 1.0
         matriz_vectores = matriz_vectores / normas
@@ -138,20 +130,19 @@ def buscar(q: str = Query("")):
     if not query or not catalogo_metadatos or matriz_vectores is None:
         return []
 
-    # 1. Si es una búsqueda directa simple o una frase compleja, dejamos que Gemini entienda la intención
+    # 1. Gemini interpreta la intención
     titulos_a_buscar = interpretar_intencion_con_gemini(query)
 
-    # 2. Vectorizar las sugerencias de la IA de forma agrupada
-    vectores_consulta = vectorizar_texto_batch(titulos_a_buscar)
-
-    # 3. Calcular similitudes contra las 24,272 obras en la RAM de forma masiva
+    # 2. Cruzar cada sugerencia contra la matriz en RAM
     similitudes_totales = np.zeros(len(catalogo_metadatos), dtype=np.float32)
 
-    for v_query in vectores_consulta:
-        sims = np.dot(matriz_vectores, v_query)
-        similitudes_totales = np.maximum(similitudes_totales, sims)
+    for titulo in titulos_a_buscar:
+        v_query = vectorizar_texto_seguro(titulo)
+        if v_query is not None:
+            sims = np.dot(matriz_vectores, v_query)
+            similitudes_totales = np.maximum(similitudes_totales, sims)
 
-    # 4. Impulso extra para coincidencias de texto plano (rescata nombres cortos o mal escritos)
+    # 3. Impulso extra para nombres cortos o mal escritos (ej. "Big Bang")
     palabras_query = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 2]
     for idx, item in enumerate(catalogo_metadatos):
         titulo_lower = str(item.get("title", "")).lower()
@@ -159,7 +150,7 @@ def buscar(q: str = Query("")):
             if palabra in titulo_lower:
                 similitudes_totales[idx] += 0.20
 
-    # 5. Obtener exactamente los mejores 50 resultados ordenados
+    # 4. Obtener exactamente los mejores 50 resultados ordenados
     top_50_indices = np.argsort(similitudes_totales)[::-1][:50]
     if len(top_50_indices) == 0:
         return []
