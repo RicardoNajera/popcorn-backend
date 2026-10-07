@@ -17,7 +17,7 @@ catalogo_global = {}
 async def lifespan(app: FastAPI):
     global catalogo_global
 
-    print("⏳ Conectando con Cloudflare R2 para descargar la lista...")
+    print("⏳ Conectando con Cloudflare R2 para descargar la lista maestra...")
     try:
         s3 = boto3.client(
             service_name="s3",
@@ -26,13 +26,14 @@ async def lifespan(app: FastAPI):
             aws_secret_access_key=R2_SECRET_KEY
         )
 
-        s3.download_file(R2_BUCKET, "lista_sin_subcategorias.json", "/tmp/lista_sin_subcategorias.json")
+        # Nombre actualizado exactamente al que subiste a R2
+        s3.download_file(R2_BUCKET, "iptv_database_structured.json", "/tmp/iptv_database_structured.json")
 
-        with open("/tmp/lista_sin_subcategorias.json", "r", encoding="utf-8") as f:
+        with open("/tmp/iptv_database_structured.json", "r", encoding="utf-8") as f:
             catalogo_global = json.load(f)
 
-        if os.path.exists("/tmp/lista_sin_subcategorias.json"):
-            os.remove("/tmp/lista_sin_subcategorias.json")
+        if os.path.exists("/tmp/iptv_database_structured.json"):
+            os.remove("/tmp/iptv_database_structured.json")
             
         gc.collect()
         print(f"✅ ¡Catálogo cargado en RAM exitosamente! Secciones: {list(catalogo_global.keys())}")
@@ -73,14 +74,12 @@ def obtener_seccion(tipo: str = "Televisión"):
         primera_key = list(catalogo_global.keys())[0]
         seccion = catalogo_global[primera_key]
 
-    # NORMALIZADOR UNIVERSAL: Transforma cualquier estructura (TV, Películas, Series) en filas planas para Roku
     resultado_normalizado = {}
 
     if isinstance(seccion, dict):
         primera_val = next(iter(seccion.values())) if seccion else None
         
         if isinstance(primera_val, list):
-            # Caso Televisión o Películas (clave -> lista de items)
             for row_name, items in seccion.items():
                 lista_limpia = []
                 if isinstance(items, list):
@@ -95,7 +94,6 @@ def obtener_seccion(tipo: str = "Televisión"):
                     resultado_normalizado[str(row_name)] = lista_limpia
                     
         elif isinstance(primera_val, dict):
-            # Caso Series (Serie -> Temporada -> lista de episodios)
             for serie_name, temporadas in seccion.items():
                 if isinstance(temporadas, dict):
                     for temp_name, eps in temporadas.items():
