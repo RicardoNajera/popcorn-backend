@@ -11,7 +11,7 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET", "popcorn-cloud")
 
-# Aquí vivirá toda tu estructura JSON (Televisión, Películas, Series) en RAM
+# Aquí se almacenará todo el contenido del JSON en la memoria RAM
 catalogo_global = {}
 
 @asynccontextmanager
@@ -27,14 +27,14 @@ async def lifespan(app: FastAPI):
             aws_secret_access_key=R2_SECRET_KEY
         )
 
-        # Descargamos tu archivo JSON estructurado desde R2
-        s3.download_file(R2_BUCKET, "iptv_database_structured.json", "/tmp/iptv_database_structured.json")
+        # Descargamos exactamente tu archivo lista_sin_subcategorias.json desde R2
+        s3.download_file(R2_BUCKET, "lista_sin_subcategorias.json", "/tmp/lista_sin_subcategorias.json")
 
-        with open("/tmp/iptv_database_structured.json", "r", encoding="utf-8") as f:
+        with open("/tmp/lista_sin_subcategorias.json", "r", encoding="utf-8") as f:
             catalogo_global = json.load(f)
 
-        if os.path.exists("/tmp/iptv_database_structured.json"):
-            os.remove("/tmp/iptv_database_structured.json")
+        if os.path.exists("/tmp/lista_sin_subcategorias.json"):
+            os.remove("/tmp/lista_sin_subcategorias.json")
             
         gc.collect()
         print(f"✅ ¡Catálogo cargado en RAM exitosamente! Secciones: {list(catalogo_global.keys())}")
@@ -58,7 +58,7 @@ def home():
 
 @app.get("/api/catalogo")
 def obtener_catalogo():
-    """Devuelve todo el JSON estructurado para que la app lo navegue de forma local o por secciones."""
+    """Devuelve todo el diccionario estructurado de tu JSON."""
     return catalogo_global
 
 @app.get("/api/buscar")
@@ -67,37 +67,29 @@ def buscar(
     tipo: str = Query("Televisión")
 ):
     """
-    Busca de forma instantánea y ligera dentro de la categoría seleccionada (Televisión, Películas o Series).
+    Busca elementos de forma ligera y directa en la categoría solicitada por Roku.
     """
     query = q.strip().lower()
     
-    # Seleccionamos la categoría principal del JSON
+    # Obtenemos la sección correspondiente del JSON (ej. 'Televisión')
     seccion = catalogo_global.get(tipo, {})
     if not seccion:
         return []
 
     resultados = []
 
-    # Si es Televisión (viene por subcategorías/carpetas)
-    if tipo == "Televisión":
-        for subcategoria, canales in seccion.items():
-            for canal in canales:
-                if not query or query in canal.get("title", "").lower():
+    # Recorrido eficiente dentro de las subcategorías o listas del JSON
+    for subcategoria, elementos in seccion.items():
+        if isinstance(elementos, list):
+            for item in elementos:
+                titulo = str(item.get("title", ""))
+                if not query or query in titulo.lower():
                     resultados.append({
                         "subcategoria": subcategoria,
-                        "title": canal.get("title"),
-                        "logo": canal.get("logo"),
-                        "url": canal.get("url")
+                        "title": titulo,
+                        "logo": item.get("logo", ""),
+                        "url": item.get("url", "")
                     })
-    
-    # Si son Películas o Series (vienen agrupadas por nombre)
-    else:
-        for nombre, contenido in seccion.items():
-            if not query or query in nombre.lower():
-                resultados.append({
-                    "nombre": nombre,
-                    "contenido": contenido
-                })
 
-    # Limitamos para que la tele no procese de más de golpe
+    # Limitamos los resultados para optimizar el rendimiento en la televisión
     return resultados[:100]
