@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Error al cargar el archivo desde R2: {e}")
     yield
 
-# 1. PRIMERO SE INSTANCIA FASTAPI Y EL LIFESPAN
+# 1. Instanciación de FastAPI y su lifespan
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
@@ -51,14 +51,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. LUEGO SE DEFINEN LAS RUTAS CON @app.get
+# 2. Definición de rutas
 @app.get("/")
 def home():
     return {"status": "online", "categorias_disponibles": list(catalogo_global.keys())}
 
+@app.get("/api/seccion")
+def obtener_seccion(tipo: str = "Televisión"):
+    print(f"📥 Petición de sección completa -> tipo: '{tipo}'")
+    if not catalogo_global:
+        return {}
+
+    tipo_limpio = tipo.strip().lower()
+    for k, v in catalogo_global.items():
+        k_limpio = k.strip().lower()
+        if k_limpio == tipo_limpio or tipo_limpio in k_limpio:
+            return v  # Devuelve la estructura jerárquica exacta de la sección
+
+    # Por defecto si no coincide exacto, devuelve la primera sección disponible
+    if catalogo_global:
+        primera_key = list(catalogo_global.keys())[0]
+        return catalogo_global[primera_key]
+    return {}
+
 @app.get("/api/buscar")
 def buscar(q: str = "", tipo: str = "Televisión"):
-    print(f"📥 Petición recibida -> q: '{q}', tipo: '{tipo}'")
+    print(f"📥 Petición de búsqueda recibida -> q: '{q}', tipo: '{tipo}'")
     
     if not catalogo_global:
         print("⚠️ El catálogo global está vacío.")
