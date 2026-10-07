@@ -40,7 +40,6 @@ async def lifespan(app: FastAPI):
         print(f"❌ Error al cargar el archivo desde R2: {e}")
     yield
 
-# 1. Instanciación de FastAPI y su lifespan
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
@@ -51,73 +50,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Definición de rutas
 @app.get("/")
 def home():
     return {"status": "online", "categorias_disponibles": list(catalogo_global.keys())}
 
 @app.get("/api/seccion")
 def obtener_seccion(tipo: str = "Televisión"):
-    print(f"📥 Petición de sección completa -> tipo: '{tipo}'")
+    print(f"📥 Petición de sección -> tipo: '{tipo}'")
     if not catalogo_global:
         return {}
-
-    tipo_limpio = tipo.strip().lower()
-    for k, v in catalogo_global.items():
-        k_limpio = k.strip().lower()
-        if k_limpio == tipo_limpio or tipo_limpio in k_limpio:
-            return v  # Devuelve la estructura jerárquica exacta de la sección
-
-    # Por defecto si no coincide exacto, devuelve la primera sección disponible
-    if catalogo_global:
-        primera_key = list(catalogo_global.keys())[0]
-        return catalogo_global[primera_key]
-    return {}
-
-@app.get("/api/buscar")
-def buscar(q: str = "", tipo: str = "Televisión"):
-    print(f"📥 Petición de búsqueda recibida -> q: '{q}', tipo: '{tipo}'")
-    
-    if not catalogo_global:
-        print("⚠️ El catálogo global está vacío.")
-        return []
 
     tipo_limpio = tipo.strip().lower()
     seccion = None
     
     for k, v in catalogo_global.items():
         k_limpio = k.strip().lower()
-        if k_limpio == tipo_limpio or tipo_limpio in k_limpio:
+        if k_limpio == tipo_limpio or tipo_limpio in k:
             seccion = v
             break
             
-    if not seccion and len(catalogo_global) > 0:
+    if not seccion and catalogo_global:
         primera_key = list(catalogo_global.keys())[0]
         seccion = catalogo_global[primera_key]
 
-    resultados = []
+    # NORMALIZADOR UNIVERSAL: Transforma cualquier estructura (TV, Películas, Series) en filas planas para Roku
+    resultado_normalizado = {}
 
     if isinstance(seccion, dict):
-        for subcat, canales in seccion.items():
-            if isinstance(canales, list):
-                for canal in canales:
-                    titulo = str(canal.get("title", ""))
-                    if not q or q.lower() in titulo.lower():
-                        resultados.append({
-                            "subcategoria": subcat,
-                            "title": titulo,
-                            "logo": canal.get("logo", ""),
-                            "url": canal.get("url", "")
-                        })
+        primera_val = next(iter(seccion.values())) if seccion else None
+        
+        if isinstance(primera_val, list):
+            # Caso Televisión o Películas (clave -> lista de items)
+            for row_name, items in seccion.items():
+                lista_limpia = []
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            lista_limpia.append({
+                                "title": str(item.get("title", "")),
+                                "logo": str(item.get("logo", "")),
+                                "url": str(item.get("url", ""))
+                            })
+                if lista_limpia:
+                    resultado_normalizado[str(row_name)] = lista_limpia
+                    
+        elif isinstance(primera_val, dict):
+            # Caso Series (Serie -> Temporada -> lista de episodios)
+            for serie_name, temporadas in seccion.items():
+                if isinstance(temporadas, dict):
+                    for temp_name, eps in temporadas.items():
+                        if isinstance(eps, list):
+                            row_title = f"{serie_name} - {temp_name}"
+                            lista_eps = []
+                            for ep in eps:
+                                if isinstance(ep, dict):
+                                    lista_eps.append({
+                                        "title": str(ep.get("title", "")),
+                                        "logo": str(ep.get("logo", "")),
+                                        "url": str(ep.get("url", ""))
+                                    })
+                            if lista_eps:
+                                resultado_normalizado[row_title] = lista_eps
     elif isinstance(seccion, list):
+        lista_limpia = []
         for item in seccion:
-            titulo = str(item.get("title", ""))
-            if not q or q.lower() in titulo.lower():
-                resultados.append({
-                    "subcategoria": tipo,
-                    "title": titulo,
-                    "logo": item.get("logo", ""),
-                    "url": item.get("url", "")
+            if isinstance(item, dict):
+                lista_limpia.append({
+                    "title": str(item.get("title", "")),
+                    "logo": str(item.get("logo", "")),
+                    "url": str(item.get("url", ""))
                 })
+        if lista_limpia:
+            resultado_normalizado[tipo] = lista_limpia
 
-    return resultados[:200]
+    return resultado_normalizado
