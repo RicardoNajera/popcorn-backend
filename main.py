@@ -20,7 +20,8 @@ catalogo_metadatos = []
 matriz_vectores = None
 gemini_client = None
 
-def vectorizar_texto_seguro(texto: str):
+def vectorizar_texto_puro(texto: str):
+    """Convierte tu texto directamente a vector de 768 dimensiones."""
     if not gemini_client or not texto.strip():
         return None
     try:
@@ -39,33 +40,8 @@ def vectorizar_texto_seguro(texto: str):
         norm = np.linalg.norm(vec)
         return (vec / norm) if norm > 0 else vec
     except Exception as e:
-        print(f"Aviso al vectorizar '{texto}': {e}")
+        print(f"Error vectorizando texto: {e}")
         return None
-
-def obtener_titulos_bilingues_con_gemini(query: str):
-    """Pide a Gemini el título exacto en INGLÉS y en ESPAÑOL separados por coma."""
-    if not gemini_client:
-        return [query], "Gemini no inicializado"
-    try:
-        prompt = (
-            f"El usuario busca: '{query}'. "
-            "Proporciona el título oficial de esta obra tanto en su idioma original (ej. inglés) como su título oficial doblado o traducido al español. "
-            "Responde ÚNICAMENTE con ambos títulos separados por una coma (ej: 'The Mummy, La momia'), sin explicaciones ni texto adicional."
-        )
-        response = gemini_client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=prompt,
-        )
-        texto_resp = response.text.strip().replace('"', '').replace("'", "")
-        titulos = [t.strip() for t in texto_resp.split(',') if t.strip()]
-        
-        # Asegurarnos de incluir también el query original por seguridad
-        if query not in titulos:
-            titulos.append(query)
-            
-        return titulos, texto_resp
-    except Exception as e:
-        return [query], f"Error Gemini: {str(e)}"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -75,7 +51,7 @@ async def lifespan(app: FastAPI):
         try:
             gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         except Exception as e:
-            print(f"Error iniciando Gemini: {e}")
+            print(f"Error iniciando cliente de embeddings: {e}")
 
     print("⏳ Conectando con Cloudflare R2...")
     try:
@@ -125,21 +101,17 @@ def home():
 def buscar(q: str = Query("")):
     query = q.strip()
     if not query or not catalogo_metadatos or matriz_vectores is None:
-        return {"gemini_debug": "Catálogo no listo o query vacía", "titulos_interpretados": [], "resultados": []}
+        return {"query_usada": query, "resultados": []}
 
-    # 1. Gemini nos da las versiones en inglés y español
-    titulos_a_buscar, debug_gemini = obtener_titulos_bilingues_con_gemini(query)
+    # 1. Vectorizar el texto exacto que escribió el usuario
+    v_query = vectorizar_texto_puro(query)
+    
+    if v_query is not None:
+        similitudes_totales = np.dot(matriz_vectores, v_query)
+    else:
+        similitudes_totales = np.zeros(len(catalogo_metadatos), dtype=np.float32)
 
-    # 2. Vectorizar y cruzar ambas versiones con la matriz en RAM
-    similitudes_totales = np.zeros(len(catalogo_metadatos), dtype=np.float32)
-
-    for titulo in titulos_a_buscar:
-        v_query = vectorizar_texto_seguro(titulo)
-        if v_query is not None:
-            sims = np.dot(matriz_vectores, v_query)
-            similitudes_totales = np.maximum(similitudes_totales, sims) # Nos quedamos con la mejor coincidencia entre inglés y español
-
-    # 3. Impulso extra para nombres directos en el catálogo
+    # 2. Impulso directo por palabras clave (para asegurar nombres recortados)
     palabras_query = [p.lower() for p in re.findall(r'\w+', query) if len(p) > 2]
     for idx, item in enumerate(catalogo_metadatos):
         titulo_lower = str(item.get("title", "")).lower()
@@ -147,10 +119,10 @@ def buscar(q: str = Query("")):
             if palabra in titulo_lower:
                 similitudes_totales[idx] += 0.30
 
-    # 4. Obtener EXACTAMENTE los mejores 10 resultados ordenados por la matriz
+    # 3. Obtener EXACTAMENTE los 10 mejores resultados ordenados
     top_10_indices = np.argsort(similitudes_totales)[::-1][:10]
     if len(top_10_indices) == 0:
-        return {"gemini_debug": debug_gemini, "titulos_interpretados": titulos_a_buscar, "resultados": []}
+        return {"query_usada": query, "resultados": []}
 
     max_score = float(similitudes_totales[top_10_indices[0]])
     min_score = float(similitudes_totales[top_10_indices[-1]])
@@ -173,7 +145,6 @@ def buscar(q: str = Query("")):
         resultados.append(obra)
 
     return {
-        "gemini_debug": debug_gemini,
-        "titulos_interpretados": titulos_a_buscar,
+        "query_usada": query,
         "resultados": resultados
     }
