@@ -26,14 +26,9 @@ async def lifespan(app: FastAPI):
             aws_secret_access_key=R2_SECRET_KEY
         )
 
-        # Descargamos el index_manifest.json generado por tu herramienta
-        s3.download_file(R2_BUCKET, "M3U600/index_manifest.json", "/tmp/index_manifest.json")
-
-        with open("/tmp/index_manifest.json", "r", encoding="utf-8") as f:
-            manifest_global = json.load(f)
-
-        if os.path.exists("/tmp/index_manifest.json"):
-            os.remove("/tmp/index_manifest.json")
+        # Descargamos el index_manifest.json directamente a memoria usando get_object
+        response = s3.get_object(Bucket=R2_BUCKET, Key="M3U600/index_manifest.json")
+        manifest_global = json.loads(response['Body'].read().decode('utf-8'))
             
         print(f"✅ ¡Manifiesto de bloques cargado en RAM exitosamente! Secciones: {list(manifest_global.keys())}")
     except Exception as e:
@@ -90,15 +85,9 @@ def obtener_bloque_json(tipo: str = "peliculas", pagina: int = 1):
             aws_secret_access_key=R2_SECRET_KEY
         )
 
-        # Descargamos temporalmente el bloque de 600 elementos desde R2
-        local_tmp = f"/tmp/page_{carpeta_r2}_{pagina}.json"
-        s3.download_file(R2_BUCKET, file_path_r2, local_tmp)
-
-        with open(local_tmp, "r", encoding="utf-8") as f:
-            data_bloque = json.load(f)
-
-        if os.path.exists(local_tmp):
-            os.remove(local_tmp)
+        # Leemos el bloque de 600 elementos directamente desde R2 hacia la memoria sin tocar disco
+        response = s3.get_object(Bucket=R2_BUCKET, Key=file_path_r2)
+        data_bloque = json.loads(response['Body'].read().decode('utf-8'))
 
         return {
             "tipo": carpeta_r2,
